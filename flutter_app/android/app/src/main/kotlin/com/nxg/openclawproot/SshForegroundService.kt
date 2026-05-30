@@ -108,7 +108,7 @@ class SshForegroundService : Service() {
             try {
                 val filesDir = applicationContext.filesDir.absolutePath
                 val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
-                val pm = ProcessManager(filesDir, nativeLibDir)
+                val pm = ProcessManager(applicationContext, filesDir, nativeLibDir)
 
                 // Ensure directories exist
                 val bootstrapManager = BootstrapManager(applicationContext, filesDir, nativeLibDir)

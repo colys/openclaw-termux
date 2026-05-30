@@ -50,7 +50,7 @@ class MainActivity : FlutterActivity() {
         val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
 
         bootstrapManager = BootstrapManager(applicationContext, filesDir, nativeLibDir)
-        processManager = ProcessManager(filesDir, nativeLibDir)
+        processManager = ProcessManager(applicationContext, filesDir, nativeLibDir)
 
         // Ensure directories and resolv.conf exist on every app start.
         // Android may clear filesDir during APK update (#40).

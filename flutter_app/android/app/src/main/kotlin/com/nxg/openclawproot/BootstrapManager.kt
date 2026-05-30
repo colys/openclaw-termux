@@ -41,8 +41,46 @@ class BootstrapManager(
     }
 
     private fun setupLibtalloc() {
-        val source = File("$nativeLibDir/libtalloc.so")
         val target = File("$libDir/libtalloc.so.2")
+        if (target.exists()) return
+
+        var source = File("$nativeLibDir/libtalloc.so")
+
+        // Fallback: extract from APK if not found in nativeLibDir.
+        // HarmonyOS (卓易通) may not extract custom jniLibs.
+        if (!source.exists()) {
+            try {
+                val libDirFile = File(libDir)
+                libDirFile.mkdirs()
+                val apkPath = context.applicationInfo.sourceDir
+                java.util.zip.ZipFile(apkPath).use { zip ->
+                    val arch = ArchUtils.getArch()
+                    val abi = when (arch) {
+                        "aarch64" -> "arm64-v8a"
+                        "arm" -> "armeabi-v7a"
+                        "x86_64" -> "x86_64"
+                        else -> "x86"
+                    }
+                    val candidates = listOf("lib/$abi/libtalloc.so", "lib/arm64-v8a/libtalloc.so", "lib/arm64/libtalloc.so")
+                    for (candidate in candidates.distinct()) {
+                        val entry = zip.getEntry(candidate)
+                        if (entry != null) {
+                            val localPath = File(libDir, "libtalloc.so")
+                            zip.getInputStream(entry).use { input ->
+                                java.io.FileOutputStream(localPath).use { fos ->
+                                    input.copyTo(fos)
+                                }
+                            }
+                            localPath.setReadable(true, false)
+                            localPath.setExecutable(true, false)
+                            source = localPath
+                            break
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
         if (source.exists() && !target.exists()) {
             source.copyTo(target)
             target.setExecutable(true)
@@ -1451,7 +1489,7 @@ require('/root/.openclaw/proot-compat.js');
 
     private fun checkNodeInProot(): Boolean {
         return try {
-            val pm = ProcessManager(filesDir, nativeLibDir)
+            val pm = ProcessManager(context, filesDir, nativeLibDir)
             val output = pm.runInProotSync("node --version")
             output.trim().startsWith("v")
         } catch (e: Exception) {
@@ -1461,7 +1499,7 @@ require('/root/.openclaw/proot-compat.js');
 
     private fun checkOpenClawInProot(): Boolean {
         return try {
-            val pm = ProcessManager(filesDir, nativeLibDir)
+            val pm = ProcessManager(context, filesDir, nativeLibDir)
             val output = pm.runInProotSync("command -v openclaw")
             output.trim().isNotEmpty()
         } catch (e: Exception) {

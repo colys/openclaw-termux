@@ -142,7 +142,7 @@ class GatewayService : Service() {
                 emitLog("[INFO] Setting up environment...")
                 val filesDir = applicationContext.filesDir.absolutePath
                 val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
-                val pm = ProcessManager(filesDir, nativeLibDir)
+                val pm = ProcessManager(applicationContext, filesDir, nativeLibDir)
 
                 // Recreate all directories (config, tmp, home, lib, proc/sys fakes)
                 // in case Android cleared them after an app update (#40).

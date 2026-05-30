@@ -1,10 +1,13 @@
 package com.nxg.openclawproot
 
+import android.content.Context
 import android.os.Build
 import android.os.Environment
 import java.io.BufferedReader
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStreamReader
+import java.util.zip.ZipFile
 
 /**
  * Manages proot process execution, matching Termux proot-distro as closely
@@ -13,6 +16,7 @@ import java.io.InputStreamReader
  *   - Gateway mode (buildGatewayCommand): matches proot-distro's command_login()
  */
 class ProcessManager(
+    private val context: Context,
     private val filesDir: String,
     private val nativeLibDir: String
 ) {
@@ -21,6 +25,10 @@ class ProcessManager(
     private val homeDir get() = "$filesDir/home"
     private val configDir get() = "$filesDir/config"
     private val libDir get() = "$filesDir/lib"
+    // Cache resolved native lib paths after first extraction
+    @Volatile private var resolvedProotPath: String? = null
+    @Volatile private var resolvedLoaderPath: String? = null
+    @Volatile private var resolvedLoader32Path: String? = null
 
     companion object {
         // Match proot-distro v4.37.0 defaults
@@ -29,29 +37,120 @@ class ProcessManager(
             "#1 SMP PREEMPT_DYNAMIC Fri, 10 Oct 2025 00:00:00 +0000"
     }
 
-    fun getProotPath(): String = "$nativeLibDir/libproot.so"
+    /**
+     * Resolve libproot.so path with fallback to APK extraction.
+     * HarmonyOS (卓易通) and some Android variants don't extract
+     * custom jniLibs to nativeLibraryDir. Extract from APK if missing.
+     */
+    private fun extractNativeLibIfMissing(libName: String): String {
+        // 1. Check system nativeLibDir first (standard Android)
+        val systemPath = File(nativeLibDir, libName)
+        if (systemPath.exists() && systemPath.canExecute()) {
+            return systemPath.absolutePath
+        }
+
+        // 2. Check our own libDir (already extracted by a previous call)
+        val localPath = File(libDir, libName)
+        if (localPath.exists() && localPath.canExecute()) {
+            return localPath.absolutePath
+        }
+
+        // 3. Extract from APK
+        try {
+            val libDirFile = File(libDir)
+            libDirFile.mkdirs()
+
+            val arch = when (ArchUtils.getArch()) {
+                "aarch64" -> "arm64-v8a"
+                "arm" -> "armeabi-v7a"
+                "x86_64" -> "x86_64"
+                else -> "x86"
+            }
+            val apkPath = context.applicationInfo.sourceDir
+            ZipFile(apkPath).use { zip ->
+                // Try arch-specific path, then arm64 (fallback for HarmonyOS)
+                val candidates = listOf(
+                    "lib/$arch/$libName",
+                    "lib/arm64-v8a/$libName",
+                    "lib/arm64/$libName",
+                )
+                for (candidate in candidates.distinct()) {
+                    val entry = zip.getEntry(candidate)
+                    if (entry != null) {
+                        zip.getInputStream(entry).use { input ->
+                            FileOutputStream(localPath).use { fos ->
+                                input.copyTo(fos)
+                            }
+                        }
+                        localPath.setReadable(true, false)
+                        localPath.setExecutable(true, false)
+                        return localPath.absolutePath
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Fall through to error below
+        }
+
+        throw RuntimeException(
+            "Cannot find $libName in $nativeLibDir or APK. " +
+            "Source APK: ${context.applicationInfo.sourceDir}"
+        )
+    }
+
+    fun getProotPath(): String {
+        if (resolvedProotPath == null) {
+            resolvedProotPath = extractNativeLibIfMissing("libproot.so")
+        }
+        return resolvedProotPath!!
+    }
+
+    private fun getLoaderPath(): String {
+        if (resolvedLoaderPath == null) {
+            resolvedLoaderPath = extractNativeLibIfMissing("libprootloader.so")
+        }
+        return resolvedLoaderPath!!
+    }
+
+    private fun getLoader32Path(): String {
+        if (resolvedLoader32Path == null) {
+            // libprootloader32.so only exists for arm64 (to load 32-bit apps)
+            resolvedLoader32Path = try {
+                extractNativeLibIfMissing("libprootloader32.so")
+            } catch (e: RuntimeException) {
+                "" // Not available on all architectures
+            }
+        }
+        return resolvedLoader32Path!!
+    }
 
     // ================================================================
     // Host-side environment for proot binary itself.
     // ONLY proot-specific vars — guest env is set via `env -i` inside
     // the command line, matching proot-distro's approach.
     // ================================================================
-    private fun prootEnv(): Map<String, String> = mapOf(
-        // proot temp directory for its internal use
-        "PROOT_TMP_DIR" to tmpDir,
-        // Loader executables for proot's execve interception
-        "PROOT_LOADER" to "$nativeLibDir/libprootloader.so",
-        "PROOT_LOADER_32" to "$nativeLibDir/libprootloader32.so",
-        // LD_LIBRARY_PATH: proot itself needs libtalloc.so.2
-        // This does NOT leak into the guest (env -i cleans it)
-        "LD_LIBRARY_PATH" to "$libDir:$nativeLibDir",
-        // NOTE: Do NOT set PROOT_NO_SECCOMP. proot-distro does NOT set it.
-        // Seccomp BPF filter provides efficient syscall interception AND
-        // proper fork/clone child process tracking.
-        //
-        // NOTE: Do NOT set PROOT_L2S_DIR. We extract with Java, not
-        // `proot --link2symlink tar`, so no L2S metadata exists.
-    )
+    private fun prootEnv(): Map<String, String> {
+        val env = mutableMapOf(
+            // proot temp directory for its internal use
+            "PROOT_TMP_DIR" to tmpDir,
+            // Loader executables for proot's execve interception
+            "PROOT_LOADER" to getLoaderPath(),
+            // LD_LIBRARY_PATH: proot itself needs libtalloc.so.2
+            // This does NOT leak into the guest (env -i cleans it)
+            "LD_LIBRARY_PATH" to "$libDir:$nativeLibDir",
+            // NOTE: Do NOT set PROOT_NO_SECCOMP. proot-distro does NOT set it.
+            // Seccomp BPF filter provides efficient syscall interception AND
+            // proper fork/clone child process tracking.
+            //
+            // NOTE: Do NOT set PROOT_L2S_DIR. We extract with Java, not
+            // `proot --link2symlink tar`, so no L2S metadata exists.
+        )
+        val loader32 = getLoader32Path()
+        if (loader32.isNotEmpty()) {
+            env["PROOT_LOADER_32"] = loader32
+        }
+        return env
+    }
 
     // ================================================================
     // Common proot flags shared by both install and gateway modes.
